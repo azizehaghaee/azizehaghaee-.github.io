@@ -1,1 +1,3922 @@
+# ==================================================================================================
+# MULTI-SEED VALIDATION EXPERIMENT
+# NO-CONTRAST vs SIGNED-CONTRAST
+#
+# Seeds:
+#   existing reference : 42
+#   new runs           : 123, 2026
+#
+# Models:
+#   A) No-Contrast      : Z = X
+#   B) Signed-Contrast  : Z = X - AvgPool3x3(X)
+#
+# IMPORTANT:
+#   ✓ EXACT SAME parameterized architecture
+#   ✓ EXACT SAME number of parameters = 4,687,653
+#   ✓ Same training protocol
+#   ✓ Same seed used for paired models
+#   ✓ Same writer-independent Train/Val split
+#   ✓ TEST IS NEVER EVALUATED
+#   ✓ Best checkpoint selected by Validation CER
+#   ✓ Emergency checkpoint every 100 batches
+#   ✓ Robust RNG restore
+#   ✓ Completed runs are automatically skipped
+#   ✓ Interrupted runs are automatically resumed
+#
+# FINAL OUTPUT:
+#   - Per-seed table
+#   - Mean ± Sample Std across seeds 42,123,2026
+#   - Paired Signed - NoContrast CER differences
+# ==================================================================================================
 
+import os
+import gc
+import csv
+import json
+import math
+import time
+import random
+import hashlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch.utils.data import DataLoader, Sampler
+from tqdm.auto import tqdm
+
+
+print("=" * 125)
+print("SVTR MULTI-SEED VALIDATION — NO-CONTRAST vs SIGNED-CONTRAST")
+print("=" * 125)
+
+
+# ==================================================================================================
+# 1. REQUIRED OBJECTS
+# ==================================================================================================
+
+required_objects = [
+    "SVTRTinyBackbone",
+    "train_dataset",
+    "val_dataset",
+    "test_dataset",
+    "svtr_collate_fn",
+    "charset",
+]
+
+missing = [
+    x for x in required_objects
+    if x not in globals()
+]
+
+if missing:
+    raise RuntimeError(
+        "\nRequired objects are missing:\n\n"
+        + "\n".join(f"  - {x}" for x in missing)
+        + "\n\nRun your dataset + SVTRTinyBackbone definition cells first."
+    )
+
+
+# ==================================================================================================
+# 2. GLOBAL EXPERIMENT CONFIG
+# ==================================================================================================
+
+DEVICE = torch.device(
+    "cuda:0"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+RUN_SEEDS = [123, 2026]
+
+MODES = [
+    "no_contrast",
+    "signed",
+]
+
+MODE_LABELS = {
+    "no_contrast":
+        "No-Contrast X",
+
+    "signed":
+        "Signed-Contrast X-Avg(X)",
+}
+
+IMG_H = 64
+IMG_W = 768
+
+BATCH_SIZE = 8
+NUM_WORKERS = 2
+
+MAX_EPOCHS = 40
+PATIENCE = 8
+
+LR = 5e-4
+WEIGHT_DECAY = 0.05
+BETAS = (0.9, 0.99)
+EPS = 1e-8
+
+WARMUP_EPOCHS = 2
+
+GRAD_CLIP = 5.0
+AMP_INIT_SCALE = 4096.0
+
+RTL_FINAL = True
+
+BLANK_ID = 0
+NUM_CLASSES = len(charset) + 1
+
+EMERGENCY_EVERY = 100
+
+BASELINE_PARAMS = 4_357_540
+EXPECTED_AUX_PARAMS = 4_687_653
+EXPECTED_ADDED_PARAMS = 330_113
+
+
+# ==================================================================================================
+# 3. DATA SAFETY
+# ==================================================================================================
+
+assert len(charset) == 67
+assert NUM_CLASSES == 68
+
+assert len(train_dataset) == 4025
+assert len(val_dataset) == 484
+assert len(test_dataset) == 505
+
+
+print("\nConfiguration")
+print("-" * 125)
+
+print("Device               :", DEVICE)
+
+if torch.cuda.is_available():
+    print(
+        "GPU                  :",
+        torch.cuda.get_device_name(DEVICE)
+    )
+
+print(
+    "Train / Val / Test   :",
+    len(train_dataset),
+    "/",
+    len(val_dataset),
+    "/",
+    len(test_dataset)
+)
+
+print("Input                :", f"{IMG_H}x{IMG_W}")
+print("Batch size           :", BATCH_SIZE)
+print("Max epochs           :", MAX_EPOCHS)
+print("Patience             :", PATIENCE)
+print("Learning rate        :", LR)
+print("Weight decay         :", WEIGHT_DECAY)
+print("Warmup epochs        :", WARMUP_EPOCHS)
+print("New seeds            :", RUN_SEEDS)
+print("Models               :", MODES)
+print("Test evaluation      : DISABLED")
+print("Selection criterion  : Validation CER")
+
+
+# ==================================================================================================
+# 4. OUTPUT ROOT
+# ==================================================================================================
+
+MULTI_ROOT = Path(
+    "/kaggle/working/SVTR_MULTI_SEED_VALIDATION_RESULTS"
+)
+
+MULTI_ROOT.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+PER_SEED_CSV = (
+    MULTI_ROOT
+    /
+    "multiseed_per_seed_results.csv"
+)
+
+AGGREGATE_CSV = (
+    MULTI_ROOT
+    /
+    "multiseed_mean_std_results.csv"
+)
+
+PAIRED_CSV = (
+    MULTI_ROOT
+    /
+    "paired_cer_differences.csv"
+)
+
+SUMMARY_JSON = (
+    MULTI_ROOT
+    /
+    "multiseed_summary.json"
+)
+
+
+# ==================================================================================================
+# 5. SEED
+# ==================================================================================================
+
+def set_seed(seed):
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+
+# ==================================================================================================
+# 6. SAME CTC HEAD
+# ==================================================================================================
+
+class OfficialCTCHead(nn.Module):
+
+    def __init__(
+        self,
+        in_channels=192,
+        out_channels=68
+    ):
+
+        super().__init__()
+
+        self.fc = nn.Linear(
+            in_channels,
+            out_channels
+        )
+
+        bound = (
+            1.0
+            /
+            math.sqrt(in_channels)
+        )
+
+        nn.init.uniform_(
+            self.fc.weight,
+            -bound,
+            bound
+        )
+
+        nn.init.uniform_(
+            self.fc.bias,
+            -bound,
+            bound
+        )
+
+    def forward(self, x):
+
+        return self.fc(x)
+
+
+# ==================================================================================================
+# 7. GENERIC PARAMETER-MATCHED AUXILIARY BRANCH
+#
+# IMPORTANT:
+#
+# Constructor is IDENTICAL for both modes.
+#
+# Only forward preprocessing differs:
+#
+#   no_contrast:
+#       z = X
+#
+#   signed:
+#       z = X - AvgPool3x3(X)
+#
+# Thus, for a given seed, both models begin with the same parameter initialization.
+# ==================================================================================================
+
+class MatchedAuxBranch(nn.Module):
+
+    def __init__(
+        self,
+        mode,
+        in_channels=128,
+        hidden_channels=128,
+        out_channels=256
+    ):
+
+        super().__init__()
+
+        if mode not in {
+            "no_contrast",
+            "signed"
+        }:
+            raise ValueError(
+                f"Unsupported mode: {mode}"
+            )
+
+        self.mode = mode
+
+        self.proj = nn.Sequential(
+
+            nn.Conv2d(
+                in_channels,
+                hidden_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+
+            nn.BatchNorm2d(
+                hidden_channels
+            ),
+
+            nn.GELU()
+        )
+
+        self.depthwise = nn.Sequential(
+
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=hidden_channels,
+                bias=False
+            ),
+
+            nn.BatchNorm2d(
+                hidden_channels
+            ),
+
+            nn.GELU()
+        )
+
+        self.pointwise = nn.Sequential(
+
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False
+            ),
+
+            nn.BatchNorm2d(
+                hidden_channels
+            ),
+
+            nn.GELU()
+        )
+
+        self.downsample = nn.Sequential(
+
+            nn.Conv2d(
+                hidden_channels,
+                out_channels,
+                kernel_size=3,
+                stride=(2, 1),
+                padding=1,
+                bias=False
+            ),
+
+            nn.BatchNorm2d(
+                out_channels
+            ),
+
+            nn.GELU()
+        )
+
+    def forward(self, x):
+
+        if self.mode == "no_contrast":
+
+            z = x
+
+        elif self.mode == "signed":
+
+            local_mean = F.avg_pool2d(
+                x,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            )
+
+            z = (
+                x
+                -
+                local_mean
+            )
+
+        z = self.proj(z)
+        z = self.depthwise(z)
+        z = self.pointwise(z)
+        z = self.downsample(z)
+
+        return z
+
+
+# ==================================================================================================
+# 8. GENERIC MATCHED SVTR BACKBONE
+# ==================================================================================================
+
+class SVTRMatchedAuxBackbone(nn.Module):
+
+    def __init__(
+        self,
+        mode
+    ):
+
+        super().__init__()
+
+        self.mode = mode
+
+        self.core = (
+            SVTRTinyBackbone()
+        )
+
+        self.aux_branch = MatchedAuxBranch(
+            mode=mode,
+            in_channels=128,
+            hidden_channels=128,
+            out_channels=256
+        )
+
+        self.beta_logit = nn.Parameter(
+            torch.tensor(
+                -2.0,
+                dtype=torch.float32
+            )
+        )
+
+        # Corrected final LayerNorm
+        self.norm = nn.LayerNorm(
+            256,
+            eps=1e-6
+        )
+
+        nn.init.ones_(
+            self.norm.weight
+        )
+
+        nn.init.zeros_(
+            self.norm.bias
+        )
+
+        self.H1 = 16
+        self.W1 = 192
+
+        self.H2 = 8
+        self.W2 = 192
+
+        self.H3 = 4
+        self.W3 = 192
+
+    def get_beta(self):
+
+        return torch.sigmoid(
+            self.beta_logit
+        )
+
+    def forward(
+        self,
+        x,
+        return_debug=False
+    ):
+
+        B = x.shape[0]
+
+        # ------------------------------------------------------------------------------------------
+        # Patch embedding
+        # ------------------------------------------------------------------------------------------
+
+        x = self.core.patch_embed(x)
+
+        x = (
+            x
+            +
+            self.core.pos_embed
+        )
+
+        x = self.core.pos_drop(x)
+
+        # ------------------------------------------------------------------------------------------
+        # Stage 1
+        # ------------------------------------------------------------------------------------------
+
+        for block in self.core.stage1:
+            x = block(x)
+
+        # ------------------------------------------------------------------------------------------
+        # Vertical downsample -> H=8
+        # ------------------------------------------------------------------------------------------
+
+        x, H2, W2 = self.core.sub1(
+            x,
+            self.H1,
+            self.W1
+        )
+
+        if (H2, W2) != (8, 192):
+            raise RuntimeError(
+                f"Unexpected Stage2 geometry: {H2}x{W2}"
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Stage 2
+        # ------------------------------------------------------------------------------------------
+
+        for block in self.core.stage2:
+            x = block(x)
+
+        if x.shape[1:] != (1536, 128):
+            raise RuntimeError(
+                f"Unexpected Stage2 tokens: {tuple(x.shape)}"
+            )
+
+        stage2_map = (
+            x
+            .transpose(1, 2)
+            .reshape(
+                B,
+                128,
+                8,
+                192
+            )
+        )
+
+        # ------------------------------------------------------------------------------------------
+        # Auxiliary branch
+        # ------------------------------------------------------------------------------------------
+
+        aux_map = self.aux_branch(
+            stage2_map
+        )
+
+        if aux_map.shape[1:] != (256, 4, 192):
+            raise RuntimeError(
+                f"Unexpected auxiliary map: {tuple(aux_map.shape)}"
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Base SVTR path
+        # ------------------------------------------------------------------------------------------
+
+        base, H3, W3 = self.core.sub2(
+            x,
+            H2,
+            W2
+        )
+
+        if (H3, W3) != (4, 192):
+            raise RuntimeError(
+                f"Unexpected Stage3 geometry: {H3}x{W3}"
+            )
+
+        for block in self.core.stage3:
+            base = block(base)
+
+        if base.shape[1:] != (768, 256):
+            raise RuntimeError(
+                f"Unexpected base tokens: {tuple(base.shape)}"
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Aux map -> tokens
+        # ------------------------------------------------------------------------------------------
+
+        aux_tokens = (
+            aux_map
+            .flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+        if aux_tokens.shape != base.shape:
+            raise RuntimeError(
+                f"Base/Aux mismatch: "
+                f"{tuple(base.shape)} vs {tuple(aux_tokens.shape)}"
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Gated residual fusion
+        # ------------------------------------------------------------------------------------------
+
+        beta = self.get_beta()
+
+        fused = (
+            base
+            +
+            beta
+            *
+            aux_tokens
+        )
+
+        # ------------------------------------------------------------------------------------------
+        # Corrected Final LayerNorm
+        # ------------------------------------------------------------------------------------------
+
+        fused = self.norm(
+            fused
+        )
+
+        # ------------------------------------------------------------------------------------------
+        # Tokens -> map
+        # ------------------------------------------------------------------------------------------
+
+        fused_map = (
+            fused
+            .transpose(1, 2)
+            .reshape(
+                B,
+                256,
+                4,
+                192
+            )
+        )
+
+        # ------------------------------------------------------------------------------------------
+        # Final feature projection
+        # ------------------------------------------------------------------------------------------
+
+        features = self.core.avg_pool(
+            fused_map
+        )
+
+        features = self.core.last_conv(
+            features
+        )
+
+        features = self.core.last_act(
+            features
+        )
+
+        features = self.core.last_drop(
+            features
+        )
+
+        features = (
+            features
+            .squeeze(2)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+        if features.shape[1:] != (192, 192):
+            raise RuntimeError(
+                f"Unexpected features: {tuple(features.shape)}"
+            )
+
+        if return_debug:
+
+            return {
+                "stage2_map": stage2_map,
+                "aux_map": aux_map,
+                "base_tokens": base,
+                "aux_tokens": aux_tokens,
+                "fused_tokens": fused,
+                "features": features,
+                "beta": beta,
+            }
+
+        return features
+
+
+# ==================================================================================================
+# 9. COMPLETE CTC MODEL
+# ==================================================================================================
+
+class SVTRMatchedAuxCTC(nn.Module):
+
+    def __init__(
+        self,
+        mode,
+        num_classes=68
+    ):
+
+        super().__init__()
+
+        self.mode = mode
+
+        self.backbone = (
+            SVTRMatchedAuxBackbone(
+                mode
+            )
+        )
+
+        self.ctc_head = OfficialCTCHead(
+            in_channels=192,
+            out_channels=num_classes
+        )
+
+    def forward(
+        self,
+        x,
+        rtl=True
+    ):
+
+        features = self.backbone(x)
+
+        logits = self.ctc_head(
+            features
+        )
+
+        if rtl:
+
+            logits = torch.flip(
+                logits,
+                dims=[1]
+            )
+
+        return logits
+
+
+# ==================================================================================================
+# 10. BASELINE PARAMETER SAFETY
+# ==================================================================================================
+
+class _BaselineProbe(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.core = (
+            SVTRTinyBackbone()
+        )
+
+        self.norm = nn.LayerNorm(
+            256,
+            eps=1e-6
+        )
+
+        self.head = OfficialCTCHead(
+            192,
+            68
+        )
+
+
+set_seed(42)
+
+probe = _BaselineProbe()
+
+probe_params = sum(
+    p.numel()
+    for p in probe.parameters()
+)
+
+print("\nBaseline parameter verification")
+print("-" * 125)
+
+print(
+    "Reconstructed:",
+    f"{probe_params:,}"
+)
+
+print(
+    "Expected     :",
+    f"{BASELINE_PARAMS:,}"
+)
+
+if probe_params != BASELINE_PARAMS:
+
+    raise RuntimeError(
+        f"Baseline mismatch: "
+        f"{probe_params:,} != {BASELINE_PARAMS:,}"
+    )
+
+del probe
+
+gc.collect()
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+# ==================================================================================================
+# 11. MODEL PARAMETER / SHAPE SAFETY FOR BOTH MODES
+# ==================================================================================================
+
+for safety_mode in MODES:
+
+    set_seed(42)
+
+    safety_model = SVTRMatchedAuxCTC(
+        mode=safety_mode,
+        num_classes=NUM_CLASSES
+    ).to(DEVICE)
+
+    n_params = sum(
+        p.numel()
+        for p in safety_model.parameters()
+    )
+
+    print(
+        f"{MODE_LABELS[safety_mode]:<32}",
+        f"{n_params:,} parameters"
+    )
+
+    assert (
+        n_params
+        ==
+        EXPECTED_AUX_PARAMS
+    )
+
+    loader = DataLoader(
+        val_dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=svtr_collate_fn
+    )
+
+    b = next(iter(loader))
+
+    images = b[
+        "images"
+    ].to(DEVICE)
+
+    with torch.no_grad():
+
+        debug = safety_model.backbone(
+            images,
+            return_debug=True
+        )
+
+        logits = safety_model(
+            images,
+            rtl=RTL_FINAL
+        )
+
+    assert debug["stage2_map"].shape == (
+        2,
+        128,
+        8,
+        192
+    )
+
+    assert debug["aux_map"].shape == (
+        2,
+        256,
+        4,
+        192
+    )
+
+    assert debug["base_tokens"].shape == (
+        2,
+        768,
+        256
+    )
+
+    assert debug["aux_tokens"].shape == (
+        2,
+        768,
+        256
+    )
+
+    assert debug["features"].shape == (
+        2,
+        192,
+        192
+    )
+
+    assert logits.shape == (
+        2,
+        192,
+        68
+    )
+
+    assert bool(
+        torch.isfinite(
+            logits
+        ).all()
+    )
+
+    del safety_model
+    del loader
+    del b
+    del images
+    del debug
+    del logits
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+print(
+    "\n✓ Architecture and parameter matching verified."
+)
+
+
+# ==================================================================================================
+# 12. CTC DECODER
+# ==================================================================================================
+
+id2char = {
+    i + 1: ch
+    for i, ch in enumerate(charset)
+}
+
+
+def decode_ctc_ids(ids):
+
+    result = []
+
+    previous = None
+
+    for idx in ids:
+
+        idx = int(idx)
+
+        if idx == BLANK_ID:
+
+            previous = idx
+            continue
+
+        if idx != previous:
+
+            if idx in id2char:
+
+                result.append(
+                    id2char[idx]
+                )
+
+        previous = idx
+
+    return "".join(
+        result
+    )
+
+
+def decode_logits(logits):
+
+    predicted = (
+        logits
+        .argmax(dim=-1)
+        .detach()
+        .cpu()
+    )
+
+    return [
+        decode_ctc_ids(
+            seq.tolist()
+        )
+        for seq in predicted
+    ]
+
+
+# ==================================================================================================
+# 13. EDIT DISTANCE
+# ==================================================================================================
+
+def edit_distance(a, b):
+
+    if a == b:
+        return 0
+
+    if len(a) == 0:
+        return len(b)
+
+    if len(b) == 0:
+        return len(a)
+
+    if len(a) < len(b):
+        a, b = b, a
+
+    previous = list(
+        range(
+            len(b) + 1
+        )
+    )
+
+    for i, ca in enumerate(
+        a,
+        1
+    ):
+
+        current = [i]
+
+        for j, cb in enumerate(
+            b,
+            1
+        ):
+
+            current.append(
+                min(
+                    current[j - 1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1]
+                    +
+                    (ca != cb)
+                )
+            )
+
+        previous = current
+
+    return previous[-1]
+
+
+# ==================================================================================================
+# 14. METRICS
+# ==================================================================================================
+
+def calculate_metrics(
+    predictions,
+    references
+):
+
+    char_edits = 0
+    char_total = 0
+
+    word_edits = 0
+    word_total = 0
+
+    exact_lines = 0
+
+    ned_sum = 0.0
+
+    for pred, gt in zip(
+        predictions,
+        references
+    ):
+
+        cd = edit_distance(
+            list(pred),
+            list(gt)
+        )
+
+        char_edits += cd
+        char_total += len(gt)
+
+        pred_words = pred.split()
+        gt_words = gt.split()
+
+        wd = edit_distance(
+            pred_words,
+            gt_words
+        )
+
+        word_edits += wd
+        word_total += len(gt_words)
+
+        if pred == gt:
+            exact_lines += 1
+
+        denominator = max(
+            len(pred),
+            len(gt),
+            1
+        )
+
+        ned = (
+            1.0
+            -
+            cd
+            /
+            denominator
+        )
+
+        ned_sum += max(
+            0.0,
+            ned
+        )
+
+    n = max(
+        len(references),
+        1
+    )
+
+    return {
+        "cer":
+            char_edits
+            /
+            max(char_total, 1),
+
+        "wer":
+            word_edits
+            /
+            max(word_total, 1),
+
+        "line_acc":
+            exact_lines
+            /
+            n,
+
+        "mean_1_ned":
+            ned_sum
+            /
+            n,
+    }
+
+
+# ==================================================================================================
+# 15. DETERMINISTIC EPOCH SAMPLER
+# ==================================================================================================
+
+class EpochShuffleSampler(Sampler):
+
+    def __init__(
+        self,
+        dataset,
+        seed
+    ):
+
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 1
+
+    def set_epoch(
+        self,
+        epoch
+    ):
+
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+
+        g = torch.Generator()
+
+        g.manual_seed(
+            self.seed
+            +
+            self.epoch
+            *
+            100003
+        )
+
+        indices = torch.randperm(
+            len(self.dataset),
+            generator=g
+        ).tolist()
+
+        return iter(indices)
+
+    def __len__(self):
+
+        return len(self.dataset)
+
+
+# ==================================================================================================
+# 16. RNG SAVE + ROBUST RESTORE
+# ==================================================================================================
+
+def get_rng_state():
+
+    state = {
+        "python":
+            random.getstate(),
+
+        "numpy":
+            np.random.get_state(),
+
+        "torch":
+            torch.get_rng_state(),
+    }
+
+    if torch.cuda.is_available():
+
+        state["cuda"] = (
+            torch.cuda.get_rng_state_all()
+        )
+
+    return state
+
+
+def _rng_to_cpu_byte_tensor(x):
+
+    if isinstance(
+        x,
+        torch.Tensor
+    ):
+
+        return (
+            x.detach()
+            .cpu()
+            .to(dtype=torch.uint8)
+            .contiguous()
+        )
+
+    if isinstance(
+        x,
+        np.ndarray
+    ):
+
+        return (
+            torch.from_numpy(x)
+            .to(dtype=torch.uint8)
+            .cpu()
+            .contiguous()
+        )
+
+    if isinstance(
+        x,
+        (list, tuple)
+    ):
+
+        return torch.tensor(
+            x,
+            dtype=torch.uint8,
+            device="cpu"
+        ).contiguous()
+
+    raise TypeError(
+        f"Unsupported RNG type: {type(x)}"
+    )
+
+
+def restore_rng_state(state):
+
+    if state is None:
+
+        print(
+            "⚠ RNG state unavailable."
+        )
+
+        return
+
+    try:
+
+        random.setstate(
+            state["python"]
+        )
+
+        print(
+            "✓ Python RNG restored"
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠ Python RNG:",
+            repr(e)
+        )
+
+    try:
+
+        np.random.set_state(
+            state["numpy"]
+        )
+
+        print(
+            "✓ NumPy RNG restored"
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠ NumPy RNG:",
+            repr(e)
+        )
+
+    try:
+
+        torch.set_rng_state(
+            _rng_to_cpu_byte_tensor(
+                state["torch"]
+            )
+        )
+
+        print(
+            "✓ Torch CPU RNG restored"
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠ Torch CPU RNG:",
+            repr(e)
+        )
+
+    try:
+
+        if (
+            torch.cuda.is_available()
+            and
+            "cuda" in state
+            and
+            state["cuda"] is not None
+        ):
+
+            cuda_state = (
+                state["cuda"]
+            )
+
+            if isinstance(
+                cuda_state,
+                torch.Tensor
+            ):
+
+                cuda_state = [
+                    cuda_state
+                ]
+
+            converted = [
+                _rng_to_cpu_byte_tensor(x)
+                for x in cuda_state
+            ]
+
+            n_devices = (
+                torch.cuda.device_count()
+            )
+
+            if len(converted) >= n_devices:
+
+                torch.cuda.set_rng_state_all(
+                    converted[:n_devices]
+                )
+
+            elif len(converted) > 0:
+
+                torch.cuda.set_rng_state(
+                    converted[0],
+                    device=0
+                )
+
+            print(
+                "✓ CUDA RNG restored"
+            )
+
+    except Exception as e:
+
+        print(
+            "⚠ CUDA RNG:",
+            repr(e)
+        )
+
+
+# ==================================================================================================
+# 17. ATOMIC SAVE
+# ==================================================================================================
+
+def atomic_save(
+    obj,
+    path
+):
+
+    path = Path(path)
+
+    tmp = path.with_suffix(
+        path.suffix
+        +
+        ".tmp"
+    )
+
+    torch.save(
+        obj,
+        tmp
+    )
+
+    os.replace(
+        tmp,
+        path
+    )
+
+
+# ==================================================================================================
+# 18. MOVE OPTIMIZER STATE TO DEVICE
+# ==================================================================================================
+
+def optimizer_to_device(
+    optimizer,
+    device
+):
+
+    for state in optimizer.state.values():
+
+        for k, v in state.items():
+
+            if torch.is_tensor(v):
+
+                state[k] = v.to(
+                    device
+                )
+
+
+# ==================================================================================================
+# 19. INITIAL PARAMETER HASH
+#
+# Used only as a reproducibility fingerprint.
+# For a fresh paired seed, No-Contrast and Signed should have identical parameter initialization.
+# ==================================================================================================
+
+def parameter_hash(model):
+
+    h = hashlib.sha256()
+
+    for p in model.parameters():
+
+        arr = (
+            p.detach()
+            .cpu()
+            .contiguous()
+            .numpy()
+        )
+
+        h.update(
+            arr.tobytes()
+        )
+
+    return h.hexdigest()
+
+
+# ==================================================================================================
+# 20. LOAD SEED-42 RESULTS FROM PREVIOUS EXPERIMENTS
+# ==================================================================================================
+
+NO_CONTRAST_42_FILE = Path(
+    "/kaggle/working/"
+    "SVTR_PARAMETER_MATCHED_NO_CONTRAST_RESULTS/"
+    "final_validation_comparison.json"
+)
+
+SIGNED_42_FILE = Path(
+    "/kaggle/working/"
+    "SVTR_SIGNED_CONTRAST_PHD_RESULTS/"
+    "signed_contrast_validation_comparison.json"
+)
+
+
+def load_seed42_reference():
+
+    references = {}
+
+    # ----------------------------------------------------------------------------------------------
+    # No-Contrast Seed 42
+    # ----------------------------------------------------------------------------------------------
+
+    if NO_CONTRAST_42_FILE.exists():
+
+        with open(
+            NO_CONTRAST_42_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            d = json.load(f)
+
+        v = d["validation"]
+
+        references[
+            "no_contrast"
+        ] = {
+            "seed": 42,
+            "mode": "no_contrast",
+            "model": MODE_LABELS[
+                "no_contrast"
+            ],
+            "cer": float(v["cer"]),
+            "wer": float(v["wer"]),
+            "line_acc": float(
+                v["line_accuracy"]
+            ),
+            "ned": float(
+                v["mean_1_ned"]
+            ),
+            "loss": float(v["loss"]),
+            "best_epoch": int(
+                d.get(
+                    "best_epoch",
+                    37
+                )
+            ),
+            "beta": float(
+                d.get(
+                    "best_beta",
+                    0.464873
+                )
+            ),
+            "source":
+                "existing_json",
+        }
+
+        print(
+            "✓ Seed42 No-Contrast loaded from JSON"
+        )
+
+    else:
+
+        references[
+            "no_contrast"
+        ] = {
+            "seed": 42,
+            "mode": "no_contrast",
+            "model": MODE_LABELS[
+                "no_contrast"
+            ],
+            "cer": 9.9389,
+            "wer": 38.3397,
+            "line_acc": 15.9091,
+            "ned": 89.9451,
+            "loss": 0.8018,
+            "best_epoch": 37,
+            "beta": 0.464873,
+            "source":
+                "recorded_reference",
+        }
+
+        print(
+            "⚠ Seed42 No-Contrast JSON absent; "
+            "using recorded final result."
+        )
+
+    # ----------------------------------------------------------------------------------------------
+    # Signed Seed 42
+    # ----------------------------------------------------------------------------------------------
+
+    if SIGNED_42_FILE.exists():
+
+        with open(
+            SIGNED_42_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            d = json.load(f)
+
+        v = d["validation"]
+
+        references[
+            "signed"
+        ] = {
+            "seed": 42,
+            "mode": "signed",
+            "model": MODE_LABELS[
+                "signed"
+            ],
+            "cer": float(v["cer"]),
+            "wer": float(v["wer"]),
+            "line_acc": float(
+                v["line_accuracy"]
+            ),
+            "ned": float(
+                v["mean_1_ned"]
+            ),
+            "loss": float(v["loss"]),
+            "best_epoch": int(
+                d.get(
+                    "best_epoch",
+                    38
+                )
+            ),
+            "beta": float(
+                d.get(
+                    "best_beta",
+                    0.489556
+                )
+            ),
+            "source":
+                "existing_json",
+        }
+
+        print(
+            "✓ Seed42 Signed loaded from JSON"
+        )
+
+    else:
+
+        references[
+            "signed"
+        ] = {
+            "seed": 42,
+            "mode": "signed",
+            "model": MODE_LABELS[
+                "signed"
+            ],
+            "cer": 9.9132,
+            "wer": 38.5855,
+            "line_acc": 14.6694,
+            "ned": 89.9903,
+            "loss": 0.7854,
+            "best_epoch": 38,
+            "beta": 0.489556,
+            "source":
+                "recorded_reference",
+        }
+
+        print(
+            "⚠ Seed42 Signed JSON absent; "
+            "using recorded final result."
+        )
+
+    return references
+
+
+seed42_reference = (
+    load_seed42_reference()
+)
+
+
+# ==================================================================================================
+# 21. SINGLE RUN FUNCTION
+# ==================================================================================================
+
+def run_single_experiment(
+    mode,
+    seed
+):
+
+    print("\n\n")
+    print("#" * 125)
+    print(
+        f"RUN: {MODE_LABELS[mode]} | SEED={seed}"
+    )
+    print("#" * 125)
+
+    run_root = (
+        MULTI_ROOT
+        /
+        mode
+        /
+        f"seed_{seed}"
+    )
+
+    checkpoint_dir = (
+        run_root
+        /
+        "checkpoints"
+    )
+
+    run_root.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    best_path = (
+        checkpoint_dir
+        /
+        "best.pt"
+    )
+
+    last_path = (
+        checkpoint_dir
+        /
+        "last.pt"
+    )
+
+    resume_path = (
+        checkpoint_dir
+        /
+        "resume.pt"
+    )
+
+    history_csv = (
+        run_root
+        /
+        "history.csv"
+    )
+
+    history_json = (
+        run_root
+        /
+        "history.json"
+    )
+
+    final_json = (
+        run_root
+        /
+        "final_validation_result.json"
+    )
+
+    config_json = (
+        run_root
+        /
+        "config.json"
+    )
+
+    # ==============================================================================================
+    # Already completed?
+    # ==============================================================================================
+
+    if final_json.exists():
+
+        print(
+            "✓ FINAL result already exists — skipping training."
+        )
+
+        with open(
+            final_json,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            result = json.load(f)
+
+        return result
+
+    # ==============================================================================================
+    # CLEAN GPU
+    # ==============================================================================================
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ==============================================================================================
+    # IMPORTANT: reset seed immediately before model construction
+    # ==============================================================================================
+
+    set_seed(seed)
+
+    model = SVTRMatchedAuxCTC(
+        mode=mode,
+        num_classes=NUM_CLASSES
+    ).to(DEVICE)
+
+    total_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    assert (
+        total_params
+        ==
+        EXPECTED_AUX_PARAMS
+    )
+
+    init_hash = (
+        parameter_hash(model)
+    )
+
+    print(
+        "Initial parameter SHA256:",
+        init_hash[:24] + "..."
+    )
+
+    print(
+        "Parameters              :",
+        f"{total_params:,}"
+    )
+
+    print(
+        "Initial beta            :",
+        float(
+            model.backbone
+            .get_beta()
+            .detach()
+            .cpu()
+        )
+    )
+
+    # ==============================================================================================
+    # LOADERS
+    # ==============================================================================================
+
+    train_sampler = EpochShuffleSampler(
+        train_dataset,
+        seed
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        sampler=train_sampler,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=svtr_collate_fn,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        )
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=svtr_collate_fn,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        )
+    )
+
+    steps_per_epoch = len(
+        train_loader
+    )
+
+    assert steps_per_epoch == 504
+
+    # ==============================================================================================
+    # OPTIMIZER GROUPS
+    # ==============================================================================================
+
+    decay_params = []
+    no_decay_params = []
+
+    decay_names = []
+    no_decay_names = []
+
+    for name, param in model.named_parameters():
+
+        if not param.requires_grad:
+            continue
+
+        lname = name.lower()
+
+        no_decay = (
+            param.ndim <= 1
+            or "norm" in lname
+            or "pos_embed" in lname
+            or name.endswith(".bias")
+            or "beta_logit" in lname
+        )
+
+        if no_decay:
+
+            no_decay_params.append(
+                param
+            )
+
+            no_decay_names.append(
+                name
+            )
+
+        else:
+
+            decay_params.append(
+                param
+            )
+
+            decay_names.append(
+                name
+            )
+
+    print(
+        "Decay tensors           :",
+        len(decay_params)
+    )
+
+    print(
+        "No-decay tensors        :",
+        len(no_decay_params)
+    )
+
+    print(
+        "beta no-decay           :",
+        any(
+            "beta_logit" in n
+            for n in no_decay_names
+        )
+    )
+
+    assert len(decay_params) == 58
+    assert len(no_decay_params) == 119
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params":
+                    decay_params,
+
+                "weight_decay":
+                    WEIGHT_DECAY,
+            },
+            {
+                "params":
+                    no_decay_params,
+
+                "weight_decay":
+                    0.0,
+            }
+        ],
+        lr=LR,
+        betas=BETAS,
+        eps=EPS
+    )
+
+    # ==============================================================================================
+    # AMP + CTC
+    # ==============================================================================================
+
+    ctc_loss_fn = nn.CTCLoss(
+        blank=BLANK_ID,
+        reduction="mean",
+        zero_infinity=True
+    )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        init_scale=AMP_INIT_SCALE,
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=2000,
+        enabled=torch.cuda.is_available()
+    )
+
+    # ==============================================================================================
+    # SCHEDULER
+    # ==============================================================================================
+
+    warmup_steps = (
+        WARMUP_EPOCHS
+        *
+        steps_per_epoch
+    )
+
+    total_steps = (
+        MAX_EPOCHS
+        *
+        steps_per_epoch
+    )
+
+    def lr_lambda(step):
+
+        if step < warmup_steps:
+
+            return (
+                step + 1
+            ) / max(
+                warmup_steps,
+                1
+            )
+
+        progress = (
+            step
+            -
+            warmup_steps
+        ) / max(
+            total_steps
+            -
+            warmup_steps,
+            1
+        )
+
+        progress = min(
+            max(
+                progress,
+                0.0
+            ),
+            1.0
+        )
+
+        return (
+            0.5
+            *
+            (
+                1.0
+                +
+                math.cos(
+                    math.pi
+                    *
+                    progress
+                )
+            )
+        )
+
+    scheduler = (
+        torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lr_lambda
+        )
+    )
+
+    # ==============================================================================================
+    # VALIDATION FUNCTION FOR THIS RUN
+    # ==============================================================================================
+
+    @torch.no_grad()
+    def evaluate():
+
+        model.eval()
+
+        running_loss = 0.0
+        total_samples = 0
+
+        predictions = []
+        references = []
+
+        for batch in tqdm(
+            val_loader,
+            desc="Validation",
+            leave=False
+        ):
+
+            images = batch[
+                "images"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            targets = batch[
+                "targets"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            target_lengths = batch[
+                "target_lengths"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            B = images.shape[0]
+
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=torch.cuda.is_available()
+            ):
+
+                logits = model(
+                    images,
+                    rtl=RTL_FINAL
+                )
+
+            log_probs = F.log_softmax(
+                logits.float(),
+                dim=-1
+            ).transpose(
+                0,
+                1
+            )
+
+            input_lengths = torch.full(
+                (B,),
+                logits.shape[1],
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+            loss = ctc_loss_fn(
+                log_probs,
+                targets,
+                input_lengths,
+                target_lengths
+            )
+
+            running_loss += (
+                float(
+                    loss
+                    .detach()
+                    .cpu()
+                )
+                *
+                B
+            )
+
+            total_samples += B
+
+            predictions.extend(
+                decode_logits(
+                    logits
+                )
+            )
+
+            references.extend(
+                batch["labels"]
+            )
+
+        metrics = calculate_metrics(
+            predictions,
+            references
+        )
+
+        metrics["loss"] = (
+            running_loss
+            /
+            max(
+                total_samples,
+                1
+            )
+        )
+
+        return metrics
+
+    # ==============================================================================================
+    # STATE
+    # ==============================================================================================
+
+    history = []
+
+    best_val_cer = float("inf")
+    best_val_loss = float("inf")
+
+    best_epoch = 0
+
+    epochs_without_improvement = 0
+
+    resume_epoch = 1
+    resume_batch = 0
+
+    resume_loss_sum = 0.0
+    resume_samples = 0
+    resume_skipped = 0
+
+    # ==============================================================================================
+    # CHECKPOINT CREATOR
+    # ==============================================================================================
+
+    def make_checkpoint(
+        epoch_to_resume,
+        batch_to_resume,
+        epoch_loss_sum,
+        epoch_samples,
+        epoch_skipped,
+        checkpoint_type
+    ):
+
+        return {
+            "checkpoint_type":
+                checkpoint_type,
+
+            "mode":
+                mode,
+
+            "seed":
+                int(seed),
+
+            "parameters":
+                total_params,
+
+            "initial_parameter_hash":
+                init_hash,
+
+            "resume_epoch":
+                int(
+                    epoch_to_resume
+                ),
+
+            "resume_batch":
+                int(
+                    batch_to_resume
+                ),
+
+            "epoch_loss_sum":
+                float(
+                    epoch_loss_sum
+                ),
+
+            "epoch_samples":
+                int(
+                    epoch_samples
+                ),
+
+            "epoch_skipped":
+                int(
+                    epoch_skipped
+                ),
+
+            "model_state_dict":
+                model.state_dict(),
+
+            "optimizer_state_dict":
+                optimizer.state_dict(),
+
+            "scheduler_state_dict":
+                scheduler.state_dict(),
+
+            "scaler_state_dict":
+                scaler.state_dict(),
+
+            "best_val_cer":
+                best_val_cer,
+
+            "best_val_loss":
+                best_val_loss,
+
+            "best_epoch":
+                best_epoch,
+
+            "epochs_without_improvement":
+                epochs_without_improvement,
+
+            "history":
+                history,
+
+            "rng_state":
+                get_rng_state(),
+
+            "beta":
+                float(
+                    model.backbone
+                    .get_beta()
+                    .detach()
+                    .cpu()
+                ),
+
+            "test_evaluated":
+                False,
+        }
+
+    # ==============================================================================================
+    # CONFIG
+    # ==============================================================================================
+
+    run_config = {
+        "mode":
+            mode,
+
+        "model":
+            MODE_LABELS[mode],
+
+        "seed":
+            int(seed),
+
+        "parameters":
+            total_params,
+
+        "initial_parameter_hash":
+            init_hash,
+
+        "train_samples":
+            4025,
+
+        "validation_samples":
+            484,
+
+        "test_samples":
+            505,
+
+        "test_evaluated":
+            False,
+
+        "batch_size":
+            BATCH_SIZE,
+
+        "lr":
+            LR,
+
+        "weight_decay":
+            WEIGHT_DECAY,
+
+        "betas":
+            list(BETAS),
+
+        "warmup_epochs":
+            WARMUP_EPOCHS,
+
+        "max_epochs":
+            MAX_EPOCHS,
+
+        "patience":
+            PATIENCE,
+
+        "grad_clip":
+            GRAD_CLIP,
+
+        "rtl":
+            RTL_FINAL,
+
+        "selection":
+            "minimum Validation CER",
+    }
+
+    with open(
+        config_json,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            run_config,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # ==============================================================================================
+    # AUTO RESUME
+    # ==============================================================================================
+
+    checkpoint_to_load = None
+
+    if resume_path.exists():
+
+        checkpoint_to_load = (
+            resume_path
+        )
+
+    elif last_path.exists():
+
+        checkpoint_to_load = (
+            last_path
+        )
+
+    if checkpoint_to_load is not None:
+
+        print("\n" + "=" * 125)
+        print(
+            "EXISTING RUN CHECKPOINT FOUND — AUTO RESUME"
+        )
+        print("=" * 125)
+
+        checkpoint = torch.load(
+            checkpoint_to_load,
+            map_location="cpu",
+            weights_only=False
+        )
+
+        if checkpoint.get(
+            "mode"
+        ) != mode:
+
+            raise RuntimeError(
+                "Checkpoint mode mismatch."
+            )
+
+        if int(
+            checkpoint.get(
+                "seed"
+            )
+        ) != int(seed):
+
+            raise RuntimeError(
+                "Checkpoint seed mismatch."
+            )
+
+        if int(
+            checkpoint.get(
+                "parameters"
+            )
+        ) != EXPECTED_AUX_PARAMS:
+
+            raise RuntimeError(
+                "Checkpoint parameter mismatch."
+            )
+
+        model.load_state_dict(
+            checkpoint[
+                "model_state_dict"
+            ],
+            strict=True
+        )
+
+        model.to(
+            DEVICE
+        )
+
+        optimizer.load_state_dict(
+            checkpoint[
+                "optimizer_state_dict"
+            ]
+        )
+
+        optimizer_to_device(
+            optimizer,
+            DEVICE
+        )
+
+        scheduler.load_state_dict(
+            checkpoint[
+                "scheduler_state_dict"
+            ]
+        )
+
+        scaler.load_state_dict(
+            checkpoint[
+                "scaler_state_dict"
+            ]
+        )
+
+        resume_epoch = int(
+            checkpoint.get(
+                "resume_epoch",
+                1
+            )
+        )
+
+        resume_batch = int(
+            checkpoint.get(
+                "resume_batch",
+                0
+            )
+        )
+
+        resume_loss_sum = float(
+            checkpoint.get(
+                "epoch_loss_sum",
+                0.0
+            )
+        )
+
+        resume_samples = int(
+            checkpoint.get(
+                "epoch_samples",
+                0
+            )
+        )
+
+        resume_skipped = int(
+            checkpoint.get(
+                "epoch_skipped",
+                0
+            )
+        )
+
+        best_val_cer = float(
+            checkpoint.get(
+                "best_val_cer",
+                float("inf")
+            )
+        )
+
+        best_val_loss = float(
+            checkpoint.get(
+                "best_val_loss",
+                float("inf")
+            )
+        )
+
+        best_epoch = int(
+            checkpoint.get(
+                "best_epoch",
+                0
+            )
+        )
+
+        epochs_without_improvement = int(
+            checkpoint.get(
+                "epochs_without_improvement",
+                0
+            )
+        )
+
+        history = checkpoint.get(
+            "history",
+            []
+        )
+
+        restore_rng_state(
+            checkpoint.get(
+                "rng_state"
+            )
+        )
+
+        print(
+            "Checkpoint type :",
+            checkpoint.get(
+                "checkpoint_type"
+            )
+        )
+
+        print(
+            "Resume epoch    :",
+            resume_epoch
+        )
+
+        print(
+            "Resume batch    :",
+            resume_batch
+        )
+
+        print(
+            "Best epoch      :",
+            best_epoch
+        )
+
+        if math.isfinite(
+            best_val_cer
+        ):
+
+            print(
+                "Best Val CER    :",
+                f"{best_val_cer*100:.4f}%"
+            )
+
+        print(
+            "Restored beta   :",
+            float(
+                model.backbone
+                .get_beta()
+                .detach()
+                .cpu()
+            )
+        )
+
+        print(
+            "Current LR      :",
+            optimizer
+            .param_groups[0]["lr"]
+        )
+
+    else:
+
+        print("\n" + "=" * 125)
+        print(
+            f"FRESH RUN — {MODE_LABELS[mode]} — SEED {seed}"
+        )
+        print("=" * 125)
+
+    # ==============================================================================================
+    # TRAINING
+    # ==============================================================================================
+
+    run_start = time.time()
+
+    can_train = (
+        resume_epoch <= MAX_EPOCHS
+        and
+        epochs_without_improvement < PATIENCE
+    )
+
+    if not can_train:
+
+        print(
+            "Training phase already complete; "
+            "proceeding to final validation."
+        )
+
+    for epoch in range(
+        resume_epoch,
+        MAX_EPOCHS + 1
+    ):
+
+        if (
+            epochs_without_improvement
+            >=
+            PATIENCE
+        ):
+
+            break
+
+        epoch_start = time.time()
+
+        train_sampler.set_epoch(
+            epoch
+        )
+
+        start_batch = (
+            resume_batch
+            if epoch == resume_epoch
+            else 0
+        )
+
+        if epoch == resume_epoch:
+
+            running_loss = (
+                resume_loss_sum
+            )
+
+            samples_seen = (
+                resume_samples
+            )
+
+            skipped_steps = (
+                resume_skipped
+            )
+
+        else:
+
+            running_loss = 0.0
+            samples_seen = 0
+            skipped_steps = 0
+
+        model.train()
+
+        print("\n" + "-" * 125)
+
+        print(
+            f"{MODE_LABELS[mode]} | "
+            f"SEED {seed} | "
+            f"EPOCH {epoch:02d}/{MAX_EPOCHS}"
+        )
+
+        if start_batch > 0:
+
+            print(
+                f"Resuming at batch "
+                f"{start_batch}/{steps_per_epoch}"
+            )
+
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=steps_per_epoch,
+            desc=(
+                f"{mode} S{seed} "
+                f"E{epoch:02d}"
+            )
+        )
+
+        for batch_index, batch in pbar:
+
+            if batch_index < start_batch:
+                continue
+
+            images = batch[
+                "images"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            targets = batch[
+                "targets"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            target_lengths = batch[
+                "target_lengths"
+            ].to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            B = images.shape[0]
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            # --------------------------------------------------------------------------------------
+            # FP16 forward
+            # --------------------------------------------------------------------------------------
+
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=torch.cuda.is_available()
+            ):
+
+                logits = model(
+                    images,
+                    rtl=RTL_FINAL
+                )
+
+            # --------------------------------------------------------------------------------------
+            # FP32 CTC
+            # --------------------------------------------------------------------------------------
+
+            log_probs = F.log_softmax(
+                logits.float(),
+                dim=-1
+            ).transpose(
+                0,
+                1
+            )
+
+            input_lengths = torch.full(
+                (B,),
+                logits.shape[1],
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+            loss = ctc_loss_fn(
+                log_probs,
+                targets,
+                input_lengths,
+                target_lengths
+            )
+
+            if not torch.isfinite(
+                loss
+            ):
+
+                skipped_steps += 1
+
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+                continue
+
+            scaler.scale(
+                loss
+            ).backward()
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                GRAD_CLIP
+            )
+
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
+
+            scheduler.step()
+
+            loss_value = float(
+                loss.detach().cpu()
+            )
+
+            running_loss += (
+                loss_value
+                *
+                B
+            )
+
+            samples_seen += B
+
+            beta = float(
+                model.backbone
+                .get_beta()
+                .detach()
+                .cpu()
+            )
+
+            current_lr = (
+                optimizer
+                .param_groups[0]["lr"]
+            )
+
+            pbar.set_postfix(
+                {
+                    "loss":
+                        f"{loss_value:.3f}",
+
+                    "lr":
+                        f"{current_lr:.2e}",
+
+                    "beta":
+                        f"{beta:.4f}",
+
+                    "scale":
+                        f"{scaler.get_scale():.0f}",
+                }
+            )
+
+            completed_batches = (
+                batch_index
+                +
+                1
+            )
+
+            # --------------------------------------------------------------------------------------
+            # Emergency save
+            # --------------------------------------------------------------------------------------
+
+            if (
+                completed_batches
+                %
+                EMERGENCY_EVERY
+                ==
+                0
+                and
+                completed_batches
+                <
+                steps_per_epoch
+            ):
+
+                emergency_state = (
+                    make_checkpoint(
+                        epoch_to_resume=epoch,
+                        batch_to_resume=completed_batches,
+                        epoch_loss_sum=running_loss,
+                        epoch_samples=samples_seen,
+                        epoch_skipped=skipped_steps,
+                        checkpoint_type="mid_epoch"
+                    )
+                )
+
+                atomic_save(
+                    emergency_state,
+                    resume_path
+                )
+
+                print(
+                    f"\n💾 Emergency checkpoint: "
+                    f"{mode}, Seed {seed}, "
+                    f"Epoch {epoch}, "
+                    f"Batch {completed_batches}/{steps_per_epoch}"
+                )
+
+        # ==========================================================================================
+        # END TRAIN EPOCH
+        # ==========================================================================================
+
+        resume_batch = 0
+        resume_loss_sum = 0.0
+        resume_samples = 0
+        resume_skipped = 0
+
+        train_loss = (
+            running_loss
+            /
+            max(
+                samples_seen,
+                1
+            )
+        )
+
+        # ==========================================================================================
+        # VALIDATION
+        # ==========================================================================================
+
+        val = evaluate()
+
+        val_cer = val["cer"]
+        val_wer = val["wer"]
+        val_line_acc = val[
+            "line_acc"
+        ]
+        val_ned = val[
+            "mean_1_ned"
+        ]
+        val_loss = val["loss"]
+
+        beta = float(
+            model.backbone
+            .get_beta()
+            .detach()
+            .cpu()
+        )
+
+        beta_logit = float(
+            model.backbone
+            .beta_logit
+            .detach()
+            .cpu()
+        )
+
+        current_lr = (
+            optimizer
+            .param_groups[0]["lr"]
+        )
+
+        epoch_seconds = (
+            time.time()
+            -
+            epoch_start
+        )
+
+        print("\n" + "-" * 125)
+
+        print(
+            f"{MODE_LABELS[mode]} | "
+            f"Seed {seed} | "
+            f"Epoch {epoch}"
+        )
+
+        print(
+            f"Train Loss : {train_loss:.4f}"
+        )
+
+        print(
+            f"Val Loss   : {val_loss:.4f}"
+        )
+
+        print(
+            f"Val CER    : {val_cer*100:.4f}%"
+        )
+
+        print(
+            f"Val WER    : {val_wer*100:.4f}%"
+        )
+
+        print(
+            f"Val LineAcc: "
+            f"{val_line_acc*100:.4f}%"
+        )
+
+        print(
+            f"Val 1-NED  : "
+            f"{val_ned*100:.4f}%"
+        )
+
+        print(
+            f"beta       : {beta:.6f}"
+        )
+
+        print(
+            f"LR         : {current_lr:.8f}"
+        )
+
+        print(
+            f"AMP Scale  : "
+            f"{scaler.get_scale():.0f}"
+        )
+
+        print(
+            f"Skipped    : {skipped_steps}"
+        )
+
+        # ==========================================================================================
+        # BEST BY VALIDATION CER
+        # ==========================================================================================
+
+        improved = (
+            val_cer
+            <
+            best_val_cer
+            -
+            1e-8
+            or
+            (
+                abs(
+                    val_cer
+                    -
+                    best_val_cer
+                )
+                <=
+                1e-8
+                and
+                val_loss
+                <
+                best_val_loss
+            )
+        )
+
+        if improved:
+
+            best_val_cer = val_cer
+            best_val_loss = val_loss
+            best_epoch = epoch
+
+            epochs_without_improvement = 0
+
+            print(
+                "\n✓ NEW BEST CHECKPOINT"
+            )
+
+            print(
+                "  Epoch:",
+                best_epoch
+            )
+
+            print(
+                "  CER  :",
+                f"{best_val_cer*100:.4f}%"
+            )
+
+        else:
+
+            epochs_without_improvement += 1
+
+            print(
+                "\nNo improvement:",
+                f"{epochs_without_improvement}/{PATIENCE}"
+            )
+
+        # ==========================================================================================
+        # HISTORY
+        # ==========================================================================================
+
+        row = {
+            "epoch":
+                int(epoch),
+
+            "train_loss":
+                float(train_loss),
+
+            "val_loss":
+                float(val_loss),
+
+            "val_cer":
+                float(val_cer),
+
+            "val_wer":
+                float(val_wer),
+
+            "val_line_acc":
+                float(val_line_acc),
+
+            "val_1_ned":
+                float(val_ned),
+
+            "beta":
+                float(beta),
+
+            "beta_logit":
+                float(beta_logit),
+
+            "lr":
+                float(current_lr),
+
+            "amp_scale":
+                float(
+                    scaler.get_scale()
+                ),
+
+            "skipped":
+                int(skipped_steps),
+
+            "epoch_seconds":
+                float(epoch_seconds),
+        }
+
+        history = [
+            h
+            for h in history
+            if int(
+                h["epoch"]
+            ) != epoch
+        ]
+
+        history.append(row)
+
+        history = sorted(
+            history,
+            key=lambda h:
+                int(
+                    h["epoch"]
+                )
+        )
+
+        with open(
+            history_json,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                history,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        with open(
+            history_csv,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=list(
+                    history[0].keys()
+                )
+            )
+
+            writer.writeheader()
+            writer.writerows(
+                history
+            )
+
+        # ==========================================================================================
+        # END-EPOCH CHECKPOINT
+        # ==========================================================================================
+
+        epoch_state = make_checkpoint(
+            epoch_to_resume=epoch + 1,
+            batch_to_resume=0,
+            epoch_loss_sum=0.0,
+            epoch_samples=0,
+            epoch_skipped=0,
+            checkpoint_type="end_epoch"
+        )
+
+        atomic_save(
+            epoch_state,
+            last_path
+        )
+
+        atomic_save(
+            epoch_state,
+            resume_path
+        )
+
+        if improved:
+
+            atomic_save(
+                epoch_state,
+                best_path
+            )
+
+        print(
+            "💾 End-of-epoch checkpoint saved."
+        )
+
+        # ==========================================================================================
+        # EARLY STOP
+        # ==========================================================================================
+
+        if (
+            epochs_without_improvement
+            >=
+            PATIENCE
+        ):
+
+            print(
+                "\nEARLY STOPPING"
+            )
+
+            break
+
+    # ==============================================================================================
+    # LOAD BEST MODEL
+    # ==============================================================================================
+
+    if not best_path.exists():
+
+        raise RuntimeError(
+            f"Best checkpoint missing: {best_path}"
+        )
+
+    best_state = torch.load(
+        best_path,
+        map_location="cpu",
+        weights_only=False
+    )
+
+    model.load_state_dict(
+        best_state[
+            "model_state_dict"
+        ],
+        strict=True
+    )
+
+    model.to(DEVICE)
+    model.eval()
+
+    # ==============================================================================================
+    # FINAL VALIDATION — NO TEST
+    # ==============================================================================================
+
+    print("\n" + "=" * 125)
+
+    print(
+        f"FINAL VALIDATION | "
+        f"{MODE_LABELS[mode]} | "
+        f"SEED={seed}"
+    )
+
+    print("=" * 125)
+
+    final_val = evaluate()
+
+    result = {
+        "seed":
+            int(seed),
+
+        "mode":
+            mode,
+
+        "model":
+            MODE_LABELS[mode],
+
+        "parameters":
+            total_params,
+
+        "initial_parameter_hash":
+            init_hash,
+
+        "best_epoch":
+            int(
+                best_state.get(
+                    "best_epoch",
+                    best_epoch
+                )
+            ),
+
+        "beta":
+            float(
+                model.backbone
+                .get_beta()
+                .detach()
+                .cpu()
+            ),
+
+        # Store all metrics as percentages for easy comparison
+        "cer":
+            float(
+                final_val["cer"]
+                *
+                100
+            ),
+
+        "wer":
+            float(
+                final_val["wer"]
+                *
+                100
+            ),
+
+        "line_acc":
+            float(
+                final_val[
+                    "line_acc"
+                ]
+                *
+                100
+            ),
+
+        "ned":
+            float(
+                final_val[
+                    "mean_1_ned"
+                ]
+                *
+                100
+            ),
+
+        "loss":
+            float(
+                final_val["loss"]
+            ),
+
+        "test_evaluated":
+            False,
+
+        "source":
+            "new_multiseed_run",
+
+        "run_minutes_this_session":
+            float(
+                (
+                    time.time()
+                    -
+                    run_start
+                )
+                /
+                60.0
+            ),
+    }
+
+    print(
+        f"CER       : {result['cer']:.4f}%"
+    )
+
+    print(
+        f"WER       : {result['wer']:.4f}%"
+    )
+
+    print(
+        f"Line Acc  : {result['line_acc']:.4f}%"
+    )
+
+    print(
+        f"1-NED     : {result['ned']:.4f}%"
+    )
+
+    print(
+        f"Loss      : {result['loss']:.4f}"
+    )
+
+    print(
+        f"Best epoch: {result['best_epoch']}"
+    )
+
+    print(
+        f"beta      : {result['beta']:.6f}"
+    )
+
+    with open(
+        final_json,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            result,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # ==============================================================================================
+    # CLEAN MEMORY
+    # ==============================================================================================
+
+    del model
+    del optimizer
+    del scheduler
+    del scaler
+    del train_loader
+    del val_loader
+    del train_sampler
+    del ctc_loss_fn
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
+
+
+# ==================================================================================================
+# 22. RUN NEW SEEDS
+#
+# Order is paired by seed:
+#
+# Seed 123:
+#   No-Contrast
+#   Signed
+#
+# Seed 2026:
+#   No-Contrast
+#   Signed
+#
+# set_seed(seed) is reset before each model construction.
+# ==================================================================================================
+
+all_results = []
+
+# Existing Seed 42
+all_results.append(
+    seed42_reference[
+        "no_contrast"
+    ]
+)
+
+all_results.append(
+    seed42_reference[
+        "signed"
+    ]
+)
+
+
+for seed in RUN_SEEDS:
+
+    print("\n\n")
+    print("=" * 125)
+    print(
+        f"PAIRED SEED {seed}"
+    )
+    print("=" * 125)
+
+    result_no = run_single_experiment(
+        mode="no_contrast",
+        seed=seed
+    )
+
+    all_results.append(
+        result_no
+    )
+
+    result_signed = run_single_experiment(
+        mode="signed",
+        seed=seed
+    )
+
+    all_results.append(
+        result_signed
+    )
+
+
+# ==================================================================================================
+# 23. PER-SEED TABLE
+# ==================================================================================================
+
+df = pd.DataFrame(
+    all_results
+)
+
+
+required_columns = [
+    "seed",
+    "mode",
+    "model",
+    "cer",
+    "wer",
+    "line_acc",
+    "ned",
+    "loss",
+    "best_epoch",
+    "beta",
+    "source",
+]
+
+
+df = df[
+    required_columns
+].copy()
+
+
+df = df.sort_values(
+    [
+        "seed",
+        "mode"
+    ]
+).reset_index(
+    drop=True
+)
+
+
+df.to_csv(
+    PER_SEED_CSV,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+print("\n\n")
+print("=" * 125)
+print("PER-SEED VALIDATION RESULTS")
+print("=" * 125)
+
+display_df = df.copy()
+
+for col in [
+    "cer",
+    "wer",
+    "line_acc",
+    "ned"
+]:
+
+    display_df[col] = (
+        display_df[col]
+        .map(
+            lambda x:
+                f"{x:.4f}%"
+        )
+    )
+
+
+print(
+    display_df.to_string(
+        index=False
+    )
+)
+
+
+# ==================================================================================================
+# 24. AGGREGATE MEAN ± SAMPLE STD
+#
+# ddof=1 = sample standard deviation
+# ==================================================================================================
+
+aggregate_rows = []
+
+
+for mode in MODES:
+
+    sub = df[
+        df["mode"] == mode
+    ].copy()
+
+    if len(sub) != 3:
+
+        raise RuntimeError(
+            f"{mode} does not have exactly "
+            f"3 seed results."
+        )
+
+    row = {
+        "mode":
+            mode,
+
+        "model":
+            MODE_LABELS[mode],
+
+        "n_seeds":
+            len(sub),
+
+        "seeds":
+            "42,123,2026",
+    }
+
+    for metric in [
+        "cer",
+        "wer",
+        "line_acc",
+        "ned",
+        "loss",
+        "beta",
+    ]:
+
+        vals = (
+            sub[metric]
+            .astype(float)
+            .to_numpy()
+        )
+
+        row[
+            f"{metric}_mean"
+        ] = float(
+            np.mean(vals)
+        )
+
+        row[
+            f"{metric}_std"
+        ] = float(
+            np.std(
+                vals,
+                ddof=1
+            )
+        )
+
+    aggregate_rows.append(
+        row
+    )
+
+
+agg_df = pd.DataFrame(
+    aggregate_rows
+)
+
+
+agg_df.to_csv(
+    AGGREGATE_CSV,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+# ==================================================================================================
+# 25. PAIRED CER DIFFERENCES
+#
+# Signed - NoContrast
+#
+# Negative = Signed is better
+# Positive = NoContrast is better
+# ==================================================================================================
+
+paired_rows = []
+
+
+for seed in [
+    42,
+    123,
+    2026
+]:
+
+    no_row = df[
+        (df["seed"] == seed)
+        &
+        (
+            df["mode"]
+            ==
+            "no_contrast"
+        )
+    ]
+
+    sg_row = df[
+        (df["seed"] == seed)
+        &
+        (
+            df["mode"]
+            ==
+            "signed"
+        )
+    ]
+
+    if (
+        len(no_row) != 1
+        or
+        len(sg_row) != 1
+    ):
+
+        raise RuntimeError(
+            f"Missing paired result "
+            f"for seed {seed}"
+        )
+
+    no_cer = float(
+        no_row.iloc[0]["cer"]
+    )
+
+    sg_cer = float(
+        sg_row.iloc[0]["cer"]
+    )
+
+    paired_rows.append(
+        {
+            "seed":
+                seed,
+
+            "no_contrast_cer":
+                no_cer,
+
+            "signed_cer":
+                sg_cer,
+
+            "signed_minus_no_contrast":
+                sg_cer
+                -
+                no_cer,
+        }
+    )
+
+
+paired_df = pd.DataFrame(
+    paired_rows
+)
+
+
+paired_deltas = (
+    paired_df[
+        "signed_minus_no_contrast"
+    ]
+    .to_numpy(
+        dtype=float
+    )
+)
+
+
+paired_mean = float(
+    np.mean(
+        paired_deltas
+    )
+)
+
+
+paired_std = float(
+    np.std(
+        paired_deltas,
+        ddof=1
+    )
+)
+
+
+paired_df.to_csv(
+    PAIRED_CSV,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+# ==================================================================================================
+# 26. FINAL REPORT
+# ==================================================================================================
+
+print("\n\n")
+print("=" * 125)
+print("MULTI-SEED MEAN ± SAMPLE STD — VALIDATION ONLY")
+print("=" * 125)
+
+
+for _, row in agg_df.iterrows():
+
+    print(
+        f"\n{row['model']}"
+    )
+
+    print(
+        f"  CER      : "
+        f"{row['cer_mean']:.4f} "
+        f"± {row['cer_std']:.4f}%"
+    )
+
+    print(
+        f"  WER      : "
+        f"{row['wer_mean']:.4f} "
+        f"± {row['wer_std']:.4f}%"
+    )
+
+    print(
+        f"  Line Acc : "
+        f"{row['line_acc_mean']:.4f} "
+        f"± {row['line_acc_std']:.4f}%"
+    )
+
+    print(
+        f"  1-NED    : "
+        f"{row['ned_mean']:.4f} "
+        f"± {row['ned_std']:.4f}%"
+    )
+
+    print(
+        f"  Loss     : "
+        f"{row['loss_mean']:.4f} "
+        f"± {row['loss_std']:.4f}"
+    )
+
+    print(
+        f"  beta     : "
+        f"{row['beta_mean']:.6f} "
+        f"± {row['beta_std']:.6f}"
+    )
+
+
+print("\n" + "=" * 125)
+print("PAIRED CER DIFFERENCES")
+print("Signed-Contrast − No-Contrast")
+print("Negative value favors Signed-Contrast.")
+print("=" * 125)
+
+
+print(
+    paired_df.to_string(
+        index=False,
+        formatters={
+            "no_contrast_cer":
+                lambda x:
+                    f"{x:.4f}%",
+
+            "signed_cer":
+                lambda x:
+                    f"{x:.4f}%",
+
+            "signed_minus_no_contrast":
+                lambda x:
+                    f"{x:+.4f} pp",
+        }
+    )
+)
+
+
+print(
+    "\nMean paired CER difference:"
+)
+
+print(
+    f"{paired_mean:+.4f} "
+    f"± {paired_std:.4f} "
+    f"percentage points"
+)
+
+
+# ==================================================================================================
+# 27. CAUTIOUS INTERPRETATION
+# ==================================================================================================
+
+no_agg = agg_df[
+    agg_df["mode"]
+    ==
+    "no_contrast"
+].iloc[0]
+
+
+sg_agg = agg_df[
+    agg_df["mode"]
+    ==
+    "signed"
+].iloc[0]
+
+
+print("\n" + "=" * 125)
+print("SCIENTIFIC INTERPRETATION")
+print("=" * 125)
+
+
+if (
+    sg_agg["cer_mean"]
+    <
+    no_agg["cer_mean"]
+):
+
+    print(
+        "✓ Signed-Contrast has the lower mean Validation CER across the three seeds."
+    )
+
+else:
+
+    print(
+        "✓ No-Contrast has the lower mean Validation CER across the three seeds."
+    )
+
+
+signed_wins = int(
+    np.sum(
+        paired_deltas < 0
+    )
+)
+
+
+no_wins = int(
+    np.sum(
+        paired_deltas > 0
+    )
+)
+
+
+ties = int(
+    np.sum(
+        paired_deltas == 0
+    )
+)
+
+
+print(
+    f"Paired seed wins: "
+    f"Signed={signed_wins}, "
+    f"No-Contrast={no_wins}, "
+    f"Ties={ties}"
+)
+
+
+print(
+    "\nIMPORTANT:"
+)
+
+print(
+    "These are 3-seed validation results. "
+    "Report mean ± standard deviation, "
+    "but do NOT claim statistical significance "
+    "from these results alone."
+)
+
+print(
+    "The Test set has not been evaluated "
+    "for any new multi-seed run."
+)
+
+
+# ==================================================================================================
+# 28. SAVE SUMMARY JSON
+# ==================================================================================================
+
+summary = {
+    "seeds":
+        [
+            42,
+            123,
+            2026
+        ],
+
+    "test_evaluated":
+        False,
+
+    "std_definition":
+        "sample standard deviation, ddof=1",
+
+    "per_seed_results":
+        df.to_dict(
+            orient="records"
+        ),
+
+    "aggregate":
+        agg_df.to_dict(
+            orient="records"
+        ),
+
+    "paired_cer":
+        {
+            "definition":
+                "Signed CER - No-Contrast CER",
+
+            "negative_favors":
+                "Signed-Contrast",
+
+            "per_seed":
+                paired_df.to_dict(
+                    orient="records"
+                ),
+
+            "mean":
+                paired_mean,
+
+            "std":
+                paired_std,
+
+            "signed_wins":
+                signed_wins,
+
+            "no_contrast_wins":
+                no_wins,
+
+            "ties":
+                ties,
+        },
+}
+
+
+with open(
+    SUMMARY_JSON,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        summary,
+        f,
+        ensure_ascii=False,
+        indent=2
+    )
+
+
+# ==================================================================================================
+# 29. FILES
+# ==================================================================================================
+
+print("\n" + "=" * 125)
+print("MULTI-SEED EXPERIMENT COMPLETE")
+print("=" * 125)
+
+print(
+    "Per-seed CSV :",
+    PER_SEED_CSV
+)
+
+print(
+    "Mean±Std CSV :",
+    AGGREGATE_CSV
+)
+
+print(
+    "Paired CSV   :",
+    PAIRED_CSV
+)
+
+print(
+    "Summary JSON :",
+    SUMMARY_JSON
+)
+
+print(
+    "\n✓ TEST SET EVALUATED: NO"
+)
+
+print("=" * 125)
