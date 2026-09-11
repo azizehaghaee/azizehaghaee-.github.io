@@ -1,8 +1,10 @@
 # Persian Handwritten Text Recognition Research
 
-This directory collects the code, experiment protocol, and final reported metrics from the Persian handwritten text-line recognition work carried out on the PHD line dataset.
+This directory is an **archival code repository** for the Persian handwritten text-line recognition research. Its purpose is to preserve the implementation, experiment protocol, and final reported metrics so the work can be revisited in future years.
 
-## Final dataset / protocol
+> **Dataset policy:** the dataset itself is intentionally **not included** in this repository. Only code, experiment settings, and result documentation are preserved.
+
+## Final dataset / protocol reference
 
 - 5,014 text-line images from 500 writers
 - writer-independent split: Train 4,025 / Validation 484 / Test 505
@@ -15,15 +17,18 @@ This directory collects the code, experiment protocol, and final reported metric
 ## Repository layout
 
 - `configs/final_protocol.yaml` — frozen experimental protocol
-- `svtr/final_test_signed_3seed.py` — exact final three-seed Signed-Contrast test cell used for final reporting
-- `svtr/signed_checkpoint_recovery.py` — exact recovery/retraining logic for the missing Signed checkpoints
+- `svtr/train_all_variants.py` — consolidated Baseline / Dot-Aware / No-Contrast / Signed training code
+- `svtr/final_test_signed_3seed.py` — final three-seed Signed-Contrast test code used for final reporting
+- `svtr/signed_checkpoint_recovery.py` — checkpoint recovery/retraining logic used before final test
 - `svtr/experiment_stages.md` — Baseline, Dot-Aware, No-Contrast, Signed and multi-seed chronology/results
 - `results/final_metrics.md` — article-ready final metrics
 - `legacy/` — earlier source files preserved as historical material
 
-## Reproducibility note
+## Reproducibility / archival note
 
-The final-test and recovery scripts are preserved from the final Kaggle workflow and intentionally expect the notebook objects used in that workflow (`SVTRTinyBackbone`, datasets, `svtr_collate_fn`, and `charset`) to already be defined. Earlier historical experiments were often executed as notebook cells rather than retained as standalone `.py` files. Their validated settings and results are documented in `svtr/experiment_stages.md`; code is not silently invented where an original standalone source was not retained.
+The purpose of this repository is **long-term code preservation**, not dataset distribution. Some historical experiments were executed directly as Kaggle notebook cells and were not retained as standalone source files. Where original code was available, it is preserved. Where a standalone historical source was not retained, the validated configuration and experimental result are documented rather than silently reconstructing an unverified "original" file.
+
+The final-test and recovery scripts expect the notebook objects used in the final Kaggle workflow (`SVTRTinyBackbone`, datasets, `svtr_collate_fn`, and `charset`) to already be defined. Dataset paths therefore need to be supplied by the future user when the code is run again.
 
 ## Main final SVTR result
 
