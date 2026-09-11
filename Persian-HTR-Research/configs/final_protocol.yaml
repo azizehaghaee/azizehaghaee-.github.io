@@ -1,0 +1,54 @@
+dataset:
+  total_lines: 5014
+  writers: 500
+  train_lines: 4025
+  val_lines: 484
+  test_lines: 505
+  train_writers: 400
+  val_writers: 50
+  test_writers: 50
+  split: writer-independent
+  charset_size: 67
+  ctc_classes: 68
+  p99_label_length: 123
+  max_label_length: 163
+
+input:
+  channels: 3
+  height: 64
+  width: 768
+  resize: aspect-ratio-preserving
+  padding: white
+  normalization: "[0,1] -> [-1,1]"
+  mirror_image: false
+  reverse_ground_truth: false
+  rtl_handling: temporal-logits-flip
+  temporal_length: 192
+
+training:
+  optimizer: AdamW
+  learning_rate: 0.0005
+  betas: [0.9, 0.99]
+  weight_decay: 0.05
+  warmup_epochs: 2
+  scheduler: cosine
+  batch_size: 8
+  max_epochs: 40
+  patience: 8
+  gradient_clip: 5.0
+  amp_forward: fp16
+  ctc_loss: fp32
+  selection_metric: validation_CER
+
+svtr:
+  baseline_parameters: 4357540
+  auxiliary_parameters: 4687653
+  auxiliary_added_parameters: 330113
+  auxiliary_parameter_increase_percent: 7.576
+  stage2_map: "[B,128,8,192]"
+  stage3_tokens: "[B,768,256]"
+  output_features: "[B,192,192]"
+  logits: "[B,192,68]"
+  signed_operator: "X - AvgPool3x3(X)"
+  abs_operator: "abs(X - AvgPool3x3(X))"
+  initial_beta: 0.1192029193
